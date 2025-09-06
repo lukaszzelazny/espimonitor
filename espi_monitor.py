@@ -6,7 +6,8 @@ import os
 from dotenv import load_dotenv
 import logging
 import hashlib
-
+import re
+from logging.handlers import RotatingFileHandler
 
 class ESPIMonitor:
     def __init__(self):
@@ -14,13 +15,18 @@ class ESPIMonitor:
         load_dotenv()
 
         # Konfiguracja logowania
+        file_handler = RotatingFileHandler(
+            'espi_monitor.log',
+            maxBytes=15 * 1024 * 1024,  # 5MB
+            backupCount=3
+        )
+
+        console_handler = logging.StreamHandler()
+
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler('espi_monitor.log'),
-                logging.StreamHandler()
-            ]
+            handlers=[file_handler, console_handler]
         )
         self.logger = logging.getLogger(__name__)
 
@@ -36,7 +42,7 @@ class ESPIMonitor:
             self.logger.warning(
                 "Brak obserwowanych spółek w pliku .env. Dodaj WATCHED_COMPANIES=Dekpol,InnaSpółka")
 
-        # Przechowywanie hashy poprzednich wpisów dla wykrywania nowych
+        # Przechowywanie hashy poprzednich wpisów
         self.previous_entries = set()
 
         # Konfiguracja sesji HTTP
@@ -62,71 +68,64 @@ class ESPIMonitor:
         """Parsuje HTML i wyciąga wpisy ESPI"""
         try:
             soup = BeautifulSoup(html_content, 'html.parser')
-
-            # Szukamy kontenerów z wpisami ESPI
-            # Na podstawie struktury strony, wpisy są prawdopodobnie w divach lub li
             entries = []
 
-            # Próbujemy różne selektory w zależności od struktury strony
-            possible_selectors = [
-                '.espi-item', '.espi-entry', '.report-item',
-                'div[class*="espi"]', 'li[class*="espi"]',
-                'tr', 'div.item', '.news-item'
-            ]
+            # Szukamy elementów li.news (struktura ESPI)
+            news_items = soup.find_all('li', class_='news')
 
-            for selector in possible_selectors:
-                elements = soup.select(selector)
-                if elements:
-                    self.logger.info(f"Znaleziono elementy z selektorem: {selector}")
-                    break
+            self.logger.info(f"Znaleziono {len(news_items)} elementów li.news")
 
-            # Jeśli nie znajdziemy specyficznych selektorów, szukamy linków
-            if not elements:
-                # Szukamy wszystkich linków, które mogą prowadzić do raportów
-                elements = soup.find_all('a', href=True)
-
-            for element in elements:
+            for item in news_items:
                 try:
-                    # Wyciągnij tytuł
-                    title = ""
-                    if element.get_text(strip=True):
-                        title = element.get_text(strip=True)
-                    elif element.get('title'):
-                        title = element.get('title')
+                    # Znajdź link
+                    link_elem = item.find('a', class_='link')
+                    if not link_elem:
+                        continue
 
-                    # Wyciągnij link
-                    link = ""
-                    if element.name == 'a':
-                        link = element.get('href', '')
+                    title = link_elem.get_text(strip=True)
+                    link = link_elem.get('href', '')
+
+                    # Znajdź wszystkie div.hour dla daty
+                    hour_divs = item.find_all('div', class_='hour')
+
+                    # Wyciągnij czas z pierwszego div.hour i datę/numer z drugiego
+                    time_str = ""
+                    date_info = ""
+
+                    if len(hour_divs) >= 1:
+                        time_str = hour_divs[0].get_text(strip=True)
+                    if len(hour_divs) >= 2:
+                        date_info = hour_divs[1].get_text(strip=True)
+
+                    # Stwórz datę - użyj dzisiejszej daty + czas z ESPI
+                    if time_str and re.match(r'\d{1,2}:\d{2}', time_str):
+                        today = datetime.now().strftime('%Y-%m-%d')
+                        full_date = f"{today} {time_str}"
                     else:
-                        # Szukaj linka wewnątrz elementu
-                        link_elem = element.find('a', href=True)
-                        if link_elem:
-                            link = link_elem.get('href', '')
-                            if not title:
-                                title = link_elem.get_text(strip=True)
+                        full_date = "Nie znaleziono daty"
 
-                    # Uzupełnij względny link do pełnego URL
+                    # Uzupełnij link
                     if link and not link.startswith('http'):
                         if link.startswith('/'):
                             link = 'https://espiebi.pap.pl' + link
                         else:
                             link = 'https://espiebi.pap.pl/' + link
 
-                    # Dodaj wpis jeśli ma tytuł i link
-                    if title and link and len(
-                            title) > 10:  # Filtruj bardzo krótkie teksty
+                    if title and link:
                         entries.append({
                             'title': title,
-                            'link': link
+                            'link': link,
+                            'date': full_date,
+                            'time_raw': time_str,
+                            'date_info_raw': date_info
                         })
 
                 except Exception as e:
-                    self.logger.debug(f"Błąd podczas parsowania elementu: {e}")
+                    self.logger.debug(f"Błąd parsowania elementu: {e}")
                     continue
 
-            self.logger.info(f"Znaleziono {len(entries)} wpisów")
-            return entries[:20]  # Ograniczamy do 20 najnowszych wpisów
+            self.logger.info(f"Sparsowano {len(entries)} wpisów")
+            return entries
 
         except Exception as e:
             self.logger.error(f"Błąd podczas parsowania HTML: {e}")
@@ -137,17 +136,18 @@ class ESPIMonitor:
         title_upper = title.upper()
 
         for company in self.watched_companies:
-            if company in title_upper:
+            company_upper = company.upper()
+            if company_upper in title_upper:
                 return company
         return None
 
     def generate_entry_hash(self, entry):
-        """Generuje hash wpisu do wykrywania duplikatów"""
+        """Generuje hash wpisu"""
         content = f"{entry['title']}{entry['link']}"
         return hashlib.md5(content.encode()).hexdigest()
 
     def process_entries(self, entries):
-        """Przetwarza wpisy i sprawdza czy są nowe oraz czy dotyczą obserwowanych spółek"""
+        """Przetwarza wpisy i sprawdza nowe oraz obserwowane spółki"""
         new_matches = []
         current_hashes = set()
 
@@ -155,35 +155,38 @@ class ESPIMonitor:
             entry_hash = self.generate_entry_hash(entry)
             current_hashes.add(entry_hash)
 
-            # Sprawdź czy to nowy wpis
-            if entry_hash not in self.previous_entries:
+            # Sprawdź czy nowy wpis
+            is_new = entry_hash not in self.previous_entries
+
+            if is_new:
                 # Sprawdź czy dotyczy obserwowanej spółki
                 matched_company = self.check_company_match(entry['title'])
                 if matched_company:
                     new_matches.append({
                         'company': matched_company,
                         'title': entry['title'],
-                        'link': entry['link']
+                        'link': entry['link'],
+                        'date': entry['date']
                     })
 
-        # Aktualizuj zestaw poprzednich wpisów
+        # Aktualizuj poprzednie wpisy
         self.previous_entries = current_hashes
-
         return new_matches
 
     def display_matches(self, matches):
-        """Wyświetla znalezione dopasowania w konsoli"""
+        """Wyświetla dopasowania w konsoli"""
         for match in matches:
             print("\n" + "=" * 80)
             print(f"🚨 NOWY RAPORT ESPI - {match['company']}")
             print(f"📋 Tytuł: {match['title']}")
             print(f"🔗 Link: {match['link']}")
-            print(f"⏰ Czas: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"📅 Data ESPI: {match['date']}")
+            print(f"⏰ Wykryto: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print("=" * 80 + "\n")
 
     def run_once(self):
-        """Jednorazowe sprawdzenie strony"""
-        self.logger.info("Rozpoczynam sprawdzanie strony ESPI...")
+        """Jednorazowe sprawdzenie"""
+        self.logger.info("Sprawdzam stronę ESPI...")
 
         html_content = self.fetch_page()
         if not html_content:
@@ -191,69 +194,44 @@ class ESPIMonitor:
 
         entries = self.parse_entries(html_content)
         if not entries:
-            self.logger.warning(
-                "Nie znaleziono żadnych wpisów. Możliwe, że struktura strony się zmieniła.")
+            self.logger.warning("Nie znaleziono wpisów")
             return
 
         matches = self.process_entries(entries)
 
         if matches:
             self.display_matches(matches)
-            self.logger.info(
-                f"Znaleziono {len(matches)} nowych raportów dla obserwowanych spółek")
+            self.logger.info(f"Znaleziono {len(matches)} nowych raportów")
         else:
             self.logger.info("Brak nowych raportów dla obserwowanych spółek")
 
     def run(self):
         """Główna pętla monitorowania"""
-        self.logger.info("Uruchamiam monitor ESPI. Naciśnij Ctrl+C aby zatrzymać.")
+        self.logger.info("Uruchamiam monitor ESPI. Ctrl+C aby zatrzymać.")
 
-        # Pierwsze uruchomienie - ładujemy aktualne wpisy bez powiadomień
+        # Pierwsze uruchomienie - załaduj obecne wpisy
         html_content = self.fetch_page()
         if html_content:
             entries = self.parse_entries(html_content)
 
-            ####
             matches = self.process_entries(entries)
             if matches:
                 self.display_matches(matches)
 
-            #####
-
             for entry in entries:
                 entry_hash = self.generate_entry_hash(entry)
                 self.previous_entries.add(entry_hash)
-            self.logger.info("Załadowano aktualne wpisy jako punkt odniesienia")
+            self.logger.info("Załadowano istniejące wpisy")
 
         try:
             while True:
                 self.run_once()
-                self.logger.info("Czekam 60 sekund do następnego sprawdzenia...")
-                time.sleep(60)  # Czekaj minutę
-
+                self.logger.info("Czekam 60 sekund...")
+                time.sleep(60)
         except KeyboardInterrupt:
-            self.logger.info("Monitor zatrzymany przez użytkownika")
+            self.logger.info("Monitor zatrzymany")
         except Exception as e:
-            self.logger.error(f"Nieoczekiwany błąd: {e}")
-
-    def test_entry(self, title, link):
-        """Testowa metoda do sprawdzenia konkretnego wpisu"""
-        print(f"\n🧪 TEST WPISU:")
-        print(f"Tytuł: {title}")
-        print(f"Link: {link}")
-        print(f"Obserwowane spółki: {self.watched_companies}")
-
-        matched_company = self.check_company_match(title)
-        if matched_company:
-            print(f"✅ DOPASOWANIE: {matched_company}")
-            self.display_matches([{
-                'company': matched_company,
-                'title': title,
-                'link': link
-            }])
-        else:
-            print("❌ Brak dopasowania")
-        print()
+            self.logger.error(f"Błąd: {e}")
 
 
 if __name__ == "__main__":
