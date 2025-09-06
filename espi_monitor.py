@@ -126,7 +126,6 @@ class ESPIMonitor:
                     continue
 
             self.logger.info(f"Znaleziono {len(entries)} wpisów")
-            self.logger.info(entries)
             return entries[:20]  # Ograniczamy do 20 najnowszych wpisów
 
         except Exception as e:
@@ -213,6 +212,14 @@ class ESPIMonitor:
         html_content = self.fetch_page()
         if html_content:
             entries = self.parse_entries(html_content)
+
+            ####
+            matches = self.process_entries(entries)
+            if matches:
+                self.display_matches(matches)
+
+            #####
+
             for entry in entries:
                 entry_hash = self.generate_entry_hash(entry)
                 self.previous_entries.add(entry_hash)
@@ -228,6 +235,25 @@ class ESPIMonitor:
             self.logger.info("Monitor zatrzymany przez użytkownika")
         except Exception as e:
             self.logger.error(f"Nieoczekiwany błąd: {e}")
+
+    def test_entry(self, title, link):
+        """Testowa metoda do sprawdzenia konkretnego wpisu"""
+        print(f"\n🧪 TEST WPISU:")
+        print(f"Tytuł: {title}")
+        print(f"Link: {link}")
+        print(f"Obserwowane spółki: {self.watched_companies}")
+
+        matched_company = self.check_company_match(title)
+        if matched_company:
+            print(f"✅ DOPASOWANIE: {matched_company}")
+            self.display_matches([{
+                'company': matched_company,
+                'title': title,
+                'link': link
+            }])
+        else:
+            print("❌ Brak dopasowania")
+        print()
 
 
 if __name__ == "__main__":
