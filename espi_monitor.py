@@ -18,7 +18,7 @@ class ESPIMonitor:
         file_handler = RotatingFileHandler(
             'espi_monitor.log',
             maxBytes=15 * 1024 * 1024,  # 5MB
-            backupCount=3
+            backupCount=1
         )
 
         console_handler = logging.StreamHandler()
