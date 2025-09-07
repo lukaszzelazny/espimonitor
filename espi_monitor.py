@@ -1,5 +1,5 @@
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 import time
 from datetime import datetime
 import os
@@ -7,26 +7,29 @@ from dotenv import load_dotenv
 import logging
 import hashlib
 import re
-from logging.handlers import RotatingFileHandler
+
+SECTION_END_MARKERS = [
+    "Załączniki",
+    "MESSAGE (ENGLISH VERSION)",
+    "INFORMACJE O PODMIOCIE",
+    "PODPISY OSÓB REPREZENTUJĄCYCH SPÓŁKĘ",
+    "PODPISY",
+]
 
 class ESPIMonitor:
     def __init__(self):
         # Załaduj zmienne środowiskowe
         load_dotenv()
 
-        # Konfiguracja logowania
-        file_handler = RotatingFileHandler(
-            'espi_monitor.log',
-            maxBytes=15 * 1024 * 1024,  # 5MB
-            backupCount=1
-        )
-
-        console_handler = logging.StreamHandler()
-
+        # Konfiguracja logowania - proste bez rotacji
+        # Ale tylko INFO i wyższe poziomy (bez DEBUG)
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[file_handler, console_handler]
+            handlers=[
+                logging.FileHandler('espi_monitor.log'),
+                logging.StreamHandler()
+            ]
         )
         self.logger = logging.getLogger(__name__)
 
@@ -63,6 +66,36 @@ class ESPIMonitor:
         except requests.RequestException as e:
             self.logger.error(f"Błąd podczas pobierania strony: {e}")
             return None
+
+    def pobierz_komunikat_espiebi(self, url: str) -> dict:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        full_text = soup.get_text("\n", strip=True)
+
+        # --- TEMAT ---
+        temat = None
+        m = re.search(r"Temat\s*[:\-]?\s*(.+)", full_text)
+        if m:
+            temat = m.group(1).strip()
+        else:
+            h1 = soup.find("h1")
+            if h1:
+                temat = h1.get_text(strip=True)
+
+        # --- TREŚĆ ---
+        tresc = None
+        m = re.search(r"Treść raportu:\s*(.+)", full_text, re.S)
+        if m:
+            tresc = m.group(1).strip()
+            # przytnij na pierwszym markerze
+            for marker in SECTION_END_MARKERS:
+                idx = tresc.find(marker)
+                if idx != -1:
+                    tresc = tresc[:idx].strip()
+                    break
+
+        return {"temat": temat, "tresc": tresc}
 
     def parse_entries(self, html_content):
         """Parsuje HTML i wyciąga wpisy ESPI"""
@@ -111,13 +144,17 @@ class ESPIMonitor:
                         else:
                             link = 'https://espiebi.pap.pl/' + link
 
+                    dane = self.pobierz_komunikat_espiebi(link)
+
                     if title and link:
                         entries.append({
                             'title': title,
                             'link': link,
                             'date': full_date,
                             'time_raw': time_str,
-                            'date_info_raw': date_info
+                            'date_info_raw': date_info,
+                            'report': dane['temat'],
+                            'details': dane['tresc']
                         })
 
                 except Exception as e:
@@ -166,7 +203,9 @@ class ESPIMonitor:
                         'company': matched_company,
                         'title': entry['title'],
                         'link': entry['link'],
-                        'date': entry['date']
+                        'date': entry['date'],
+                        'report': entry['report'],
+                        'details': entry['details']
                     })
 
         # Aktualizuj poprzednie wpisy
@@ -178,9 +217,27 @@ class ESPIMonitor:
         for match in matches:
             print("\n" + "=" * 80)
             print(f"🚨 NOWY RAPORT ESPI - {match['company']}")
-            print(f"📋 Tytuł: {match['title']}")
+            print(f"📋 Nagłówek: {match['title']}")
             print(f"🔗 Link: {match['link']}")
             print(f"📅 Data ESPI: {match['date']}")
+            print(f"📋 Temat: {match['report']}")
+            print(f"📋 Treść: {match['details']}")
+
+            # Wyświetl szczegóły raportu jeśli są dostępne
+            # if match.get('report_title'):
+            #     print(f"📝 Tytuł komunikatu: {match['report_title']}")
+            # else:
+            #     print(f"📝 Tytuł komunikatu: Nie udało się pobrać")
+
+            # if match.get('report_content'):
+            #     # Ogranicz długość treści do 500 znaków dla czytelności
+            #     content = match['report_content']
+            #     if len(content) > 500:
+            #         content = content[:500] + "..."
+            #     print(f"📄 Treść komunikatu: {content}")
+            # else:
+            #     print(f"📄 Treść komunikatu: Nie udało się pobrać")
+
             print(f"⏰ Wykryto: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print("=" * 80 + "\n")
 
