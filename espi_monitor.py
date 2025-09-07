@@ -1,5 +1,7 @@
 import requests
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup
+from openai import OpenAI
+
 import time
 from datetime import datetime
 import os
@@ -17,6 +19,20 @@ SECTION_END_MARKERS = [
 ]
 
 class ESPIMonitor:
+    model = "gpt-4o-mini"
+    system_prompt = """
+    Jesteś analitykiem giełdowym. Twoim zadaniem jest ocenić komunikat giełdowy (ESPI). 
+    Ocenę wyrażasz jako liczbę całkowitą od -5 do 5:
+    -5 oznacza bardzo negatywny wpływ na kurs akcji,
+    0 oznacza neutralny,
+    5 oznacza bardzo pozytywny (np. nowe kontrakty, znaczące zyski).  
+
+    Odpowiadaj wyłącznie w formacie JSON: 
+    {
+      "ocena": <liczba od -5 do 5>,
+      "uzasadnienie": "<krótkie uzasadnienie oceny>"
+    }
+    """
     def __init__(self):
         # Załaduj zmienne środowiskowe
         load_dotenv()
@@ -35,6 +51,7 @@ class ESPIMonitor:
 
         # URL strony ESPI
         self.url = "https://espiebi.pap.pl/"
+        self.client = OpenAI(api_key=os.getenv('OPENAI_API', ''))
 
         # Obserwowane spółki z pliku .env
         watched_companies_str = os.getenv('WATCHED_COMPANIES', '')
@@ -213,8 +230,20 @@ class ESPIMonitor:
         return new_matches
 
     def display_matches(self, matches):
+
         """Wyświetla dopasowania w konsoli"""
         for match in matches:
+            temat = match['report']
+            tresc = match['details']
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages = [
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": f"Temat: {temat}\nTreść: {tresc}"}
+                ]
+            )
+
+
             print("\n" + "=" * 80)
             print(f"🚨 NOWY RAPORT ESPI - {match['company']}")
             print(f"📋 Nagłówek: {match['title']}")
@@ -222,23 +251,8 @@ class ESPIMonitor:
             print(f"📅 Data ESPI: {match['date']}")
             print(f"📋 Temat: {match['report']}")
             print(f"📋 Treść: {match['details']}")
-
-            # Wyświetl szczegóły raportu jeśli są dostępne
-            # if match.get('report_title'):
-            #     print(f"📝 Tytuł komunikatu: {match['report_title']}")
-            # else:
-            #     print(f"📝 Tytuł komunikatu: Nie udało się pobrać")
-
-            # if match.get('report_content'):
-            #     # Ogranicz długość treści do 500 znaków dla czytelności
-            #     content = match['report_content']
-            #     if len(content) > 500:
-            #         content = content[:500] + "..."
-            #     print(f"📄 Treść komunikatu: {content}")
-            # else:
-            #     print(f"📄 Treść komunikatu: Nie udało się pobrać")
-
             print(f"⏰ Wykryto: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"📋 OCENA AI: {completion.choices[0].message.content}")
             print("=" * 80 + "\n")
 
     def run_once(self):
