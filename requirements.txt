@@ -3,3 +3,5 @@ beautifulsoup4==4.12.2
 python-dotenv==1.0.0
 lxml==4.9.3
 openai
+python-telegram-bot>=20.0
+dotenv

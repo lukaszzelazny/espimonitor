@@ -9,6 +9,12 @@ from dotenv import load_dotenv
 import logging
 import hashlib
 import re
+import multiprocessing
+
+load_dotenv()
+
+TOKEN = os.getenv("TG_BOT_TOKEN")      # ustaw w ENV: TG_BOT_TOKEN
+CHAT_ID = os.getenv("TG_CHAT_ID")      # ustaw w ENV: TG_CHAT_ID
 
 SECTION_END_MARKERS = [
     "Załączniki",
@@ -21,21 +27,26 @@ SECTION_END_MARKERS = [
 class ESPIMonitor:
     model = "gpt-4o-mini"
     system_prompt = """
-    Jesteś analitykiem giełdowym. Twoim zadaniem jest ocenić komunikat giełdowy (ESPI). 
+    Jesteś analitykiem giełdowym. Twoim zadaniem jest ocenić komunikat giełdowy (ESPI) pod kątem jego krótkoterminowego wpływu na kurs akcji spółki.
+    
+    Skup się przede wszystkim na informacjach, które realnie mogą wpływać na notowania: nowe kontrakty, znaczący klient, wyniki finansowe, istotne zmiany strategii, wezwania, kryzysy, istotne inwestycje lub partnerstwa. 
+    Traktuj komunikaty formalne, administracyjne i techniczne (np. rejestracja akcji, dopuszczenie do obrotu, zmiany w radzie nadzorczej, zgody KNF) jako neutralne, chyba że niosą dodatkowe znaczenie biznesowe.
+    
     Ocenę wyrażasz jako liczbę całkowitą od -5 do 5:
-    -5 oznacza bardzo negatywny wpływ na kurs akcji,
-    0 oznacza neutralny,
-    5 oznacza bardzo pozytywny (np. nowe kontrakty, znaczące zyski).  
-
-    Odpowiadaj wyłącznie w formacie JSON: 
+    -5 = bardzo negatywny wpływ na kurs (np. duża strata, utrata kontraktu, problemy prawne),
+    0 = neutralny (np. sprawy formalne, zmiany techniczne bez wpływu na biznes),
+    +5 = bardzo pozytywny (np. przełomowy kontrakt, znaczący wzrost zysków, strategiczne partnerstwo).
+    
+    Odpowiadaj wyłącznie w formacie JSON:
     {
       "ocena": <liczba od -5 do 5>,
       "uzasadnienie": "<krótkie uzasadnienie oceny>"
     }
+
     """
     def __init__(self):
         # Załaduj zmienne środowiskowe
-        load_dotenv()
+
 
         # Konfiguracja logowania - proste bez rotacji
         # Ale tylko INFO i wyższe poziomy (bez DEBUG)
@@ -230,30 +241,48 @@ class ESPIMonitor:
         return new_matches
 
     def display_matches(self, matches):
-
-        """Wyświetla dopasowania w konsoli"""
+        """Wyświetla dopasowania w konsoli i wysyła na Telegram"""
         for match in matches:
             temat = match['report']
             tresc = match['details']
             completion = self.client.chat.completions.create(
                 model=self.model,
-                messages = [
+                messages=[
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": f"Temat: {temat}\nTreść: {tresc}"}
                 ]
             )
 
-
+            # Wyświetlenie w konsoli
             print("\n" + "=" * 80)
             print(f"🚨 NOWY RAPORT ESPI - {match['company']}")
             print(f"📋 Nagłówek: {match['title']}")
             print(f"🔗 Link: {match['link']}")
             print(f"📅 Data ESPI: {match['date']}")
             print(f"📋 Temat: {match['report']}")
-            print(f"📋 Treść: {match['details']}")
             print(f"⏰ Wykryto: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"📋 OCENA AI: {completion.choices[0].message.content}")
             print("=" * 80 + "\n")
+
+            # Przygotowanie wiadomości Telegram w formacie HTML
+            ai_ocena = completion.choices[0].message.content
+            telegram_message = f"""🚨 <b>NOWY RAPORT ESPI - {match['company']}</b>
+
+    📋 <b>Nagłówek:</b> {match['title']}
+
+    🔗 <b>Link:</b> <a href="{match['link']}">Zobacz raport</a>
+
+    📅 <b>Data ESPI:</b> {match['date']}
+
+    📋 <b>Temat:</b> {temat}
+
+    ⏰ <b>Wykryto:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+    🤖 <b>OCENA AI:</b>
+    {ai_ocena}"""
+
+            # Wysłanie wiadomości na Telegram
+            send_telegram_message(telegram_message)
 
     def run_once(self):
         """Jednorazowe sprawdzenie"""
@@ -304,7 +333,31 @@ class ESPIMonitor:
         except Exception as e:
             self.logger.error(f"Błąd: {e}")
 
+def send_telegram_message(text, parse_mode="HTML"):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if not resp.ok:
+            print(f"[TG] Błąd wysyłki: {resp.status_code} {resp.text}")
+    except Exception as e:
+        print(f"[TG] Wyjątek przy wysyłce: {e}")
 
 if __name__ == "__main__":
-    monitor = ESPIMonitor()
-    monitor.run()
+    print("Starting Telegram bot...")
+    try:
+        # Uruchom bota w osobnym procesie
+        send_telegram_message(
+            f"🟢 Bot działa i będzie monitorował ESPI.")
+        monitor = ESPIMonitor()
+        bot_process = multiprocessing.Process(target=monitor.run())
+        bot_process.start()
+        print(f"Bot process started with PID: {bot_process.pid}")
+
+    except KeyboardInterrupt:
+        print("Przerwano ręcznie.")
+        if bot_process.is_alive():
+            bot_process.terminate()
+            bot_process.join()

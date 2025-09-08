@@ -1,2 +1,3 @@
 /.env
 /espi_monitor.log
+/app/espi_monitor.log
