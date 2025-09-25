@@ -10,6 +10,7 @@ import logging
 import hashlib
 import re
 import multiprocessing
+from dane_finansowe import pobierz_raport_finansowy_espi
 
 load_dotenv()
 
@@ -22,6 +23,17 @@ SECTION_END_MARKERS = [
     "INFORMACJE O PODMIOCIE",
     "PODPISY OSÓB REPREZENTUJĄCYCH SPÓŁKĘ",
     "PODPISY",
+]
+
+FINANCIAL_SECTION_END_MARKERS = [
+    "Podpisy osób odpowiedzialnych",
+    "Podpisy członków zarządu",
+    "Załączniki",
+    "Dodatkowe informacje",
+    "Komentarz zarządu",
+    "Oświadczenia",
+    "Data sporządzenia",
+    "Warszawa, dnia"
 ]
 
 class ESPIMonitor:
@@ -44,6 +56,33 @@ class ESPIMonitor:
     }
 
     """
+    report_prompt = """Jesteś doświadczonym analitykiem giełdowym specjalizującym się w analizie raportów finansowych spółek publicznych. 
+Twoim zadaniem jest ocena wpływu przedstawionych danych finansowych na prawdopodobny kierunek kursu akcji spółki.
+
+KRYTERIA OCENY:
+- Analizuj kluczowe wskaźniki: przychody, rentowność, przepływy pieniężne, zadłużenie, sytuację bilansową
+- Porównuj dane rok do roku (dynamikę zmian)
+- Uwzględniaj trendy i stabilność wyników
+- Oceniaj w kontekście oczekiwań rynkowych i kondycji sektora
+
+SKALA OCENY:
+-5: Bardzo negatywny wpływ na kurs (poważne problemy finansowe, drastyczny spadek wyników)
+-4: Silnie negatywny (wyraźne pogorszenie wyników, niepokojące trendy)
+-3: Negatywny (spadek kluczowych wskaźników, słabe wyniki)
+-2: Lekko negatywny (niewielkie pogorszenie lub mieszane sygnały z przewagą negatywnych)
+-1: Słabo negatywny (stabilne wyniki z drobnymi negatywnymi aspektami)
+0: Neutralny (brak znaczących zmian, wyniki zgodne z oczekiwaniami)
+1: Słabo pozytywny (stabilne wyniki z drobnymi pozytywnymi aspektami)
+2: Lekko pozytywny (niewielka poprawa lub mieszane sygnały z przewagą pozytywnych)
+3: Pozytywny (wzrost kluczowych wskaźników, dobre wyniki)
+4: Silnie pozytywny (wyraźna poprawa wyników, pozytywne trendy)
+5: Bardzo pozytywny wpływ na kurs (wybitne wyniki, znaczący wzrost rentowności)
+
+ODPOWIADAJ WYŁĄCZNIE W FORMACIE JSON:
+{
+    "ocena": <liczba od -5 do 5>,
+    "uzasadnienie": "<zwięzłe uzasadnienie oceny w 2-3 zdaniach, skupiające się na najważniejszych czynnikach>"
+}"""
     def __init__(self):
         # Załaduj zmienne środowiskowe
 
@@ -61,8 +100,9 @@ class ESPIMonitor:
         self.logger = logging.getLogger(__name__)
 
         # URL strony ESPI
-        self.url = "https://espiebi.pap.pl/"
+        self.url = "https://espiebi.pap.pl/?page=0"
         self.client = OpenAI(api_key=os.getenv('OPENAI_API', ''))
+        self.checkConstants = ['RAPORT']
 
         # Obserwowane spółki z pliku .env
         watched_companies_str = os.getenv('WATCHED_COMPANIES', '')
@@ -143,7 +183,15 @@ class ESPIMonitor:
                     if not link_elem:
                         continue
 
+                    isReport = False
                     title = link_elem.get_text(strip=True)
+                    upperTitle = title.upper()
+
+                    for const in self.checkConstants:
+                        if const in upperTitle:
+                            isReport = True
+                            break
+
                     link = link_elem.get('href', '')
 
                     # Znajdź wszystkie div.hour dla daty
@@ -172,9 +220,10 @@ class ESPIMonitor:
                         else:
                             link = 'https://espiebi.pap.pl/' + link
 
-                    dane = self.pobierz_komunikat_espiebi(link)
+                    dane = pobierz_raport_finansowy_espi(link) if isReport \
+                        else self.pobierz_komunikat_espiebi(link)
 
-                    if title and link:
+                    if isReport:
                         entries.append({
                             'title': title,
                             'link': link,
@@ -182,7 +231,20 @@ class ESPIMonitor:
                             'time_raw': time_str,
                             'date_info_raw': date_info,
                             'report': dane['temat'],
-                            'details': dane['tresc']
+                            'details': dane['dane_finansowe'],
+                            'isReport': True
+                        })
+
+                    elif title and link:
+                        entries.append({
+                            'title': title,
+                            'link': link,
+                            'date': full_date,
+                            'time_raw': time_str,
+                            'date_info_raw': date_info,
+                            'report': dane['temat'],
+                            'details': dane['tresc'],
+                            'isReport': False
                         })
 
                 except Exception as e:
@@ -199,6 +261,10 @@ class ESPIMonitor:
     def check_company_match(self, title):
         """Sprawdza czy tytuł zawiera nazwę obserwowanej spółki"""
         title_upper = title.upper()
+
+        for const in self.checkConstants:
+            if const in title_upper:
+                return True
 
         for company in self.watched_companies:
             company_upper = company.upper()
@@ -228,12 +294,13 @@ class ESPIMonitor:
                 matched_company = self.check_company_match(entry['title'])
                 if matched_company:
                     new_matches.append({
-                        'company': matched_company,
+                        'company': entry['title'] if matched_company is True else matched_company,
                         'title': entry['title'],
                         'link': entry['link'],
                         'date': entry['date'],
                         'report': entry['report'],
-                        'details': entry['details']
+                        'details': entry['details'],
+                        'isReport': entry['isReport']
                     })
 
         # Aktualizuj poprzednie wpisy
@@ -245,13 +312,32 @@ class ESPIMonitor:
         for match in matches:
             temat = match['report']
             tresc = match['details']
-            completion = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": f"Temat: {temat}\nTreść: {tresc}"}
-                ]
-            )
+            isReport = match['isReport']
+            if isReport:
+                user_content = f"""TEMAT RAPORTU: {temat}
+
+                DANE FINANSOWE (JSON):
+                {tresc}
+
+                Przeanalizuj powyższe dane finansowe jak doświadczony analityk giełdowy i oceń prawdopodobny wpływ na kurs akcji spółki."""
+                completion = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self.report_prompt},
+                        {"role": "user", "content": user_content}
+                    ],
+                    temperature=0.3,
+                    # Niższa temperatura dla bardziej konsystentnych analiz
+                    max_tokens=500  # Ograniczenie dla zwięzłej odpowiedzi
+                )
+            else:
+                completion = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self.system_prompt},
+                        {"role": "user", "content": f"Temat: {temat}\nTreść: {tresc}"}
+                    ]
+                )
 
             # Wyświetlenie w konsoli
             print("\n" + "=" * 80)
